@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Downloaded data files (large, hosted on HF Hub)
+# These get auto-downloaded on first run — never commit them.
+marm_behavior/data/ground_normalized.npz
+marm_behavior/data/nn_model/
+marm_behavior/data/nn_reference/*.csv
+marm_behavior/data/nn_reference/*.npy
+marm_behavior/data/nn_reference/*.bin
+marm_behavior/data/nn_reference/*.json
+marm_behavior/data/dlc_model/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+*.log

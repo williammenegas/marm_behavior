@@ -1,0 +1,117 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marm_behavior"
+version = "0.1.0"
+description = "Multi-animal marmoset behavioral analysis pipeline (DeepLabCut pose tracking + LSTM encoder + openTSNE clustering)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "William Menegas", email = "william.s.menegas@gmail.com" },
+]
+maintainers = [
+    { name = "William Menegas", email = "william.s.menegas@gmail.com" },
+]
+keywords = [
+    "neuroscience",
+    "behavior",
+    "marmoset",
+    "primate",
+    "deeplabcut",
+    "pose-estimation",
+    "tsne",
+    "behavioral-clustering",
+    "computational-ethology",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.9",
+    "h5py>=3.6",
+    # Used by `_data_files.ensure_data_file` to lazily download the
+    # bundled DLC model, NN encoder, and NN reference set from the
+    # Hugging Face Hub on first use. Required because shipping these
+    # files in the wheel would push it well past 300 MB.
+    "huggingface_hub>=0.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/williammenegas/marm_behavior"
+Repository = "https://github.com/williammenegas/marm_behavior"
+Issues = "https://github.com/williammenegas/marm_behavior/issues"
+"Reference Data" = "https://huggingface.co/datasets/williammenegas/data"
+
+[project.optional-dependencies]
+# OpenCV for Stage 3 video reading. On Windows/Anaconda, the headless
+# variant avoids pulling in Qt.
+video = ["opencv-python-headless>=4.5"]
+# imageio fallback if OpenCV isn't available.
+imageio = ["imageio>=2.25", "imageio-ffmpeg>=0.4.7"]
+# DeepLabCut for the Stage 0 inference step. Install one of the two
+# backend extras (tf or pytorch) depending on your environment; this
+# entry just pins the version range we've tested against.
+dlc = ["deeplabcut>=2.2"]
+# Stage 5 (nn postprocessing): LSTM encoder (tensorflow), t-SNE
+# projection (openTSNE), k-NN index for the native cache format
+# (annoy — also openTSNE's default k-NN backend), KNN cluster
+# assignment and optional bootstrap DBSCAN (scikit-learn). If you
+# already have deeplabcut installed, you already have tensorflow;
+# just add the other three:
+#     pip install openTSNE annoy scikit-learn
+nn = [
+    "tensorflow>=2.5",
+    "openTSNE>=0.7",
+    "annoy>=1.17",
+    "scikit-learn>=1.0",
+]
+# Optional faster downloader for the bundled data files. Cuts the
+# ~3 GB first-run download time roughly in half on repos that use
+# Xet Storage (which williammenegas/data does). Install with:
+#     pip install marm_behavior[fast-download]
+fast-download = ["hf_xet"]
+
+[project.scripts]
+# Makes `marm-behavior <video.avi>` work after `pip install`
+marm-behavior = "marm_behavior.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["marm_behavior", "marm_behavior.*"]
+
+[tool.setuptools.package-data]
+# Heavy data files (the DLC model, NN encoder, ground_normalized
+# array, and NN reference set) are NOT shipped in the wheel —
+# together they're ~310 MB, and bundling them would make every
+# install painful. Instead they're hosted on the Hugging Face Hub
+# at https://huggingface.co/datasets/williammenegas/data and
+# downloaded lazily on first use by
+# :mod:`marm_behavior._data_files`. The downloads are cached
+# under ``~/.cache/huggingface/hub/`` so they only happen once
+# per machine.
+#
+# We still ship the small README files so users browsing the
+# installed package source can see what each ``data/`` subfolder
+# is for, even on a fresh install before any data has been
+# downloaded.
+"marm_behavior" = [
+    "data/README.txt",
+    "data/nn_reference/README.txt",
+]
