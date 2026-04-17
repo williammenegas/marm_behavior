@@ -344,6 +344,8 @@ def _encode_windows(
         ``current_size`` across all non-skipped outer iterations.
     """
     from tensorflow.keras.models import load_model
+    from tensorflow.keras.backend import clear_session
+    from numpy.lib.stride_tricks import sliding_window_view
 
     num_to_encode = int(x_in.shape[0])
     if num_to_encode < SEQUENCE_SIZE + 2:
@@ -387,7 +389,35 @@ def _encode_windows(
     except ImportError:
         progress = None
 
-    m_running: "Optional[np.ndarray]" = None
+    # Zero-copy strided view over every length-SEQUENCE_SIZE window in
+    # x_in. ``all_windows[i]`` aliases ``x_in[i : i + SEQUENCE_SIZE, :]``
+    # without materialising a copy. This replaces the original's
+    # per-outer-iteration allocate-1.44GB-of-zeros-then-fill-row-by-row
+    # pattern (``x_input = np.zeros((MAX_TO_ENCODE, SEQUENCE_SIZE,
+    # NUM_FEATURES), uint8); for g: x_input[i] = x_in[g : g + SEQUENCE_SIZE]``).
+    # Shape is (n_frames - SEQUENCE_SIZE + 1, 1, SEQUENCE_SIZE,
+    # NUM_FEATURES); the singleton axis is the ``NUM_FEATURES -
+    # NUM_FEATURES + 1 = 1`` window count along the feature axis and is
+    # squeezed out. The slice is non-contiguous; tf.keras handles the
+    # strided-to-contiguous copy internally when building the input
+    # tensor for predict(). Values fed to the model are bit-identical.
+    all_windows = sliding_window_view(
+        x_in, (SEQUENCE_SIZE, NUM_FEATURES)
+    ).squeeze(axis=1)
+
+    # Pre-allocate the full output in one shot. The original used
+    # ``m_running = np.vstack((m_running, m))`` at each outer iteration,
+    # which is O(n^2) in the number of outer iterations because each
+    # vstack copies all previous data. We know the exact total row
+    # count up front (the ``total_windows`` computed just above, which
+    # honours the same skip-small-chunk guard as the loop), so we can
+    # allocate once and write per-iteration slices directly. Kept as
+    # ``None`` when ``total_windows == 0`` so the post-loop sentinel
+    # still fires for pathological inputs.
+    m_running: "Optional[np.ndarray]" = (
+        np.empty((total_windows, N_LATENT)) if total_windows > 0 else None
+    )
+    m_running_offset = 0
 
     try:
         for loop_encode in range(0, num_to_encode, MAX_TO_ENCODE):
@@ -404,36 +434,41 @@ def _encode_windows(
             # WINDOW_SIZE-1 windows at the end of long videos. Matches
             # original ``if current_size > window_size`` guard.
             if current_size > WINDOW_SIZE:
-                x_input = np.zeros(
-                    (MAX_TO_ENCODE, SEQUENCE_SIZE, NUM_FEATURES),
-                    dtype=np.uint8,
-                )
-                x_count = 0
-                for g in range(current_min, current_max):
-                    x_input[x_count, :, :] = x_in[g : g + SEQUENCE_SIZE, :]
-                    x_count += 1
-                x_input = x_input[0:x_count, :, :]
+                # Strided view of just this iteration's windows -- no
+                # copy, no zero-fill. tf.keras.Model.predict will
+                # materialise contiguous GPU buffers from this below.
+                x_input = all_windows[current_min:current_max]
 
-                m = np.zeros((current_size, N_LATENT))
+                assert m_running is not None  # total_windows > 0 here
                 for g in range(0, current_size, GPU_SIZE):
                     sub = x_input[g : g + GPU_SIZE, :, :]
                     temp = me1.predict(sub, verbose=0, batch_size=BATCH_SIZE)
                     # First timestep -- see docstring quirk above.
                     if temp.ndim == 3:
                         temp = temp[:, 0, :]
-                    m[g : g + sub.shape[0], :] = temp
+                    # Write this GPU chunk straight into the pre-allocated
+                    # output instead of into a throwaway per-iteration
+                    # ``m`` buffer that then got vstacked on.
+                    m_running[
+                        m_running_offset + g :
+                        m_running_offset + g + sub.shape[0],
+                        :,
+                    ] = temp
                     if progress is not None:
                         progress.update(sub.shape[0])
 
-                if loop_encode == 0:
-                    m_running = m
-                else:
-                    assert m_running is not None
-                    m_running = np.vstack((m_running, m))
+                m_running_offset += current_size
 
             # Free the per-iteration model. The original does ``del me1``
             # at the same spot.
             del me1
+            # ``del`` alone drops the Python reference but leaves the
+            # model's graph nodes and weight tensors held by the Keras
+            # global backend, so the GPU memory isn't actually released
+            # and accumulates across outer iterations and across
+            # per-animal calls to this function. clear_session() wipes
+            # the global graph and frees the GPU memory for real.
+            clear_session()
     finally:
         if progress is not None:
             progress.close()

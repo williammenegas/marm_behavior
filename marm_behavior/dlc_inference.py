@@ -195,6 +195,7 @@ def run_dlc_inference(
     training_set_index: int = DEFAULT_TRAINING_SET_INDEX,
     track_method: str = DEFAULT_TRACK_METHOD,
     verbose: bool = True,
+    in_subprocess: bool = True,
 ) -> "dict[str, Path]":
     """Run DLC inference on one video, producing the CSVs Stage 1 reads.
 
@@ -215,6 +216,19 @@ def run_dlc_inference(
         configuration (shuffle=1, trainset99, ellipse tracker).
     verbose:
         If True, log each DLC sub-step.
+    in_subprocess:
+        If True (the default), run the DLC calls in a freshly-spawned
+        subprocess so that all GPU memory DLC claims is returned to
+        the driver when the subprocess exits. This is the only
+        reliable way to free the memory on DLC 2.2.x: TF's BFC
+        allocator keeps its pool mapped for the lifetime of the
+        process even after ``clear_session()``, and DLC holds module-
+        level references to its TF v1 session that ``clear_session()``
+        cannot reach. Set to False only for debugging (e.g. to get a
+        Python traceback in-process); expect nvidia-smi to show DLC's
+        GPU footprint persisting until the Python process exits, and
+        expect the nn stage's ``load_model`` to have less GPU memory
+        available as a result.
 
     Returns
     -------
@@ -225,9 +239,12 @@ def run_dlc_inference(
         outputs don't appear (which would indicate a DLC version mismatch
         — the CSV filename convention has changed across releases).
     """
-    try:
-        import deeplabcut as dlc
-    except ImportError as err:
+    # Lightweight importability check in the parent so callers get a
+    # quick, readable error on a misconfigured env without paying the
+    # ~5 s deeplabcut/tensorflow import cost up front (the subprocess
+    # path does the real import in the child).
+    import importlib.util
+    if importlib.util.find_spec("deeplabcut") is None:
         raise RuntimeError(
             "The 'dlc' stage requires deeplabcut to be installed in the "
             "current environment. Install it with one of:\n"
@@ -236,7 +253,7 @@ def run_dlc_inference(
             "Or skip this stage by passing stages=('extract','process',"
             "'depths','labels') to run() / --stages on the CLI if you "
             "already have DLC CSVs."
-        ) from err
+        )
 
     video_path = Path(video_path).expanduser().resolve()
     if not video_path.exists():
@@ -249,6 +266,8 @@ def run_dlc_inference(
         if verbose:
             print(f"[marm_behavior.dlc] {msg}")
 
+    invoke = _invoke_dlc_in_subprocess if in_subprocess else _invoke_dlc_inprocess
+
     # If the user pointed at their own config, use it directly — skip
     # the bundled-model path rewriting entirely.
     if dlc_config_override is not None:
@@ -258,31 +277,275 @@ def run_dlc_inference(
                 f"--dlc-config points at a missing file: {config_path}"
             )
         _log(f"using user-supplied DLC config: {config_path}")
-        return _invoke_dlc(
-            dlc,
+        return invoke(
             config_path,
             video_path,
             output_dir,
             shuffle,
             training_set_index,
             track_method,
+            verbose,
             _log,
         )
 
-    # Bundled path: materialise a temp project with project_path rewritten.
+    # Bundled path: materialise a temp project with project_path
+    # rewritten. The materialisation *must* live in the parent: the
+    # temp dir has to outlive the subprocess (DLC writes sibling
+    # files inside it during inference) and must be torn down
+    # regardless of how the subprocess exits.
     _log("materialising bundled DLC model to temp directory")
     with materialised_model() as config_path:
         _log(f"config: {config_path}")
-        return _invoke_dlc(
-            dlc,
+        return invoke(
             config_path,
             video_path,
             output_dir,
             shuffle,
             training_set_index,
             track_method,
+            verbose,
             _log,
         )
+
+
+def _invoke_dlc_inprocess(
+    config_path: Path,
+    video_path: Path,
+    output_dir: "Path | None",
+    shuffle: int,
+    training_set_index: int,
+    track_method: str,
+    verbose: bool,
+    log,
+) -> "dict[str, Path]":
+    """In-process variant of :func:`_invoke_dlc_in_subprocess`.
+
+    Here only for debugging (``in_subprocess=False`` in
+    :func:`run_dlc_inference`). On DLC 2.2.x the subprocess variant
+    is the only reliable way to release GPU memory before later
+    stages run, so this path is not recommended for production runs.
+    """
+    import deeplabcut as dlc
+    return _invoke_dlc(
+        dlc,
+        config_path,
+        video_path,
+        output_dir,
+        shuffle,
+        training_set_index,
+        track_method,
+        log,
+    )
+
+
+def _dlc_subprocess_worker(
+    config_path_str: str,
+    video_path_str: str,
+    output_dir_str: "str | None",
+    shuffle: int,
+    training_set_index: int,
+    track_method: str,
+    verbose: bool,
+    send_end,
+) -> None:
+    """Runs in the spawned subprocess. Imports DLC, runs the three DLC
+    calls via :func:`_invoke_dlc`, sends the resulting CSV paths (as
+    strings) back through ``send_end``, and lets the interpreter exit
+    — at which point the OS reclaims all GPU memory DLC allocated.
+
+    Defined at module scope (not nested inside another function) so
+    it's picklable across the ``spawn`` start-method boundary.
+
+    Exception handling: any exception raised during DLC execution is
+    captured along with its formatted traceback and sent back through
+    the same pipe as a ``("err", repr, tb)`` tuple. The parent side
+    re-raises it as a :class:`RuntimeError` with the child traceback
+    embedded in the message, so the caller still sees where things
+    went wrong inside DLC.
+    """
+    try:
+        # Re-silence TF inside the child; the parent's silence doesn't
+        # carry across a spawn since the child re-imports from scratch.
+        try:
+            from ._tf_quiet import silence_tensorflow_logging
+            silence_tensorflow_logging()
+        except Exception:
+            pass
+
+        try:
+            import deeplabcut as dlc
+        except ImportError as err:
+            raise RuntimeError(
+                f"deeplabcut import failed in subprocess: {err}"
+            ) from err
+
+        def _child_log(msg: str) -> None:
+            if verbose:
+                print(f"[marm_behavior.dlc] {msg}")
+
+        result = _invoke_dlc(
+            dlc,
+            Path(config_path_str),
+            Path(video_path_str),
+            Path(output_dir_str) if output_dir_str is not None else None,
+            shuffle,
+            training_set_index,
+            track_method,
+            _child_log,
+        )
+        send_end.send(
+            ("ok", str(result["single_csv"]), str(result["multi_csv"]))
+        )
+    except BaseException as err:  # noqa: BLE001 — want to ship any failure back
+        import traceback
+        try:
+            send_end.send(("err", repr(err), traceback.format_exc()))
+        except Exception:
+            # Pipe already broken; best we can do is exit non-zero and
+            # let the parent's EOFError branch handle it.
+            pass
+    finally:
+        try:
+            send_end.close()
+        except Exception:
+            pass
+
+
+def _invoke_dlc_in_subprocess(
+    config_path: Path,
+    video_path: Path,
+    output_dir: "Path | None",
+    shuffle: int,
+    training_set_index: int,
+    track_method: str,
+    verbose: bool,
+    log,
+) -> "dict[str, Path]":
+    """Spawn a fresh Python subprocess to run the DLC calls.
+
+    This is the only reliable way to release GPU memory held by DLC
+    on DLC 2.2.x / TF 2.9. Even after ``tf.keras.backend.clear_session()``
+    plus ``gc.collect()``, TF's BFC allocator keeps its GPU pool mapped
+    to the process (by design — so it can reuse pages cheaply), and
+    DLC keeps its own module-level references to a
+    ``tf.compat.v1.Session`` that ``clear_session()`` can't reach. As
+    a result nvidia-smi continues to show DLC's full footprint, and a
+    later Keras model load (the nn stage's LSTM encoder) has to fit
+    in whatever's left rather than in the full GPU. Running DLC in a
+    child process cuts this Gordian knot: when the child exits, the
+    OS unconditionally returns everything the child was holding back
+    to the CUDA driver.
+
+    The ``spawn`` start method is required (not ``fork``) because
+    ``fork`` doesn't work reliably with an already-initialised CUDA
+    context in the parent, and we can't guarantee the parent hasn't
+    touched CUDA before this call (the nn stage or an interactive
+    session might have). ``spawn`` starts a clean interpreter.
+
+    Cost: ~5 s of subprocess startup per call (Python interpreter +
+    TF + DLC import in the child). For DLC runs lasting tens of
+    seconds to minutes per video, that overhead is immaterial.
+    """
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    recv_end, send_end = ctx.Pipe(duplex=False)
+
+    log("launching DLC in isolated subprocess; GPU memory will be released when it exits")
+    proc = ctx.Process(
+        target=_dlc_subprocess_worker,
+        args=(
+            str(config_path),
+            str(video_path),
+            str(output_dir) if output_dir is not None else None,
+            shuffle,
+            training_set_index,
+            track_method,
+            verbose,
+            send_end,
+        ),
+        daemon=False,
+    )
+    proc.start()
+    # Close the parent's copy of the write end so that recv() below
+    # raises EOFError promptly if the child dies without sending,
+    # rather than hanging forever waiting on a pipe that still has a
+    # live writer (us).
+    send_end.close()
+
+    try:
+        try:
+            payload = recv_end.recv()
+        except EOFError:
+            proc.join()
+            raise RuntimeError(
+                f"DLC subprocess exited without returning a result "
+                f"(exit code {proc.exitcode}). The child's stdout / "
+                f"stderr was inherited from this process — any "
+                f"traceback DLC printed should appear above."
+            )
+    finally:
+        recv_end.close()
+
+    proc.join()
+    log(f"DLC subprocess exited (code {proc.exitcode}); GPU memory reclaimed")
+
+    tag = payload[0]
+    if tag == "err":
+        _, child_repr, child_tb = payload
+        raise RuntimeError(
+            f"DLC subprocess failed: {child_repr}\n"
+            f"--- child traceback ---\n{child_tb}"
+        )
+    if tag != "ok":
+        raise RuntimeError(
+            f"DLC subprocess returned an unexpected payload: {payload!r}"
+        )
+    _, single_csv_str, multi_csv_str = payload
+    return {
+        "single_csv": Path(single_csv_str),
+        "multi_csv": Path(multi_csv_str),
+    }
+
+
+def _release_gpu_after_dlc(log) -> None:
+    """Release TF (and torch) GPU memory held by the dlc stage.
+
+    DLC runs its ResNet detector through TensorFlow, which adds nodes
+    to the global default graph and reserves GPU memory via TF's BFC
+    allocator. When ``analyze_videos`` / ``convert_detections2tracklets``
+    return, DLC's Python handles drop, but the *global* TF state at
+    module scope stays alive — so the GPU memory is not reusable by a
+    later stage that instantiates a fresh Keras model (e.g. the nn
+    stage's LSTM encoder). On modestly-sized GPUs that causes the nn
+    stage's ``load_model`` to OOM or fall back to a slow path even
+    though DLC is no longer doing any work.
+
+    ``tf.keras.backend.clear_session()`` destroys the global Keras /
+    TF-v1-compat default-graph state, which returns DLC's tensors to
+    TF's allocator pool where a later ``load_model`` can actually
+    reuse them. ``gc.collect()`` then sweeps any Python-side handles
+    still pinning device tensors. Both calls are no-ops if TF isn't
+    actually imported, so this is safe to call on the PyTorch backend
+    too; the PyTorch half is a separate best-effort ``empty_cache``.
+
+    Kept best-effort (swallowed ImportError) so a missing deep-learning
+    dep never turns post-stage cleanup into a crash.
+    """
+    import gc
+    try:
+        from tensorflow.keras.backend import clear_session
+        clear_session()
+    except ImportError:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+    gc.collect()
+    log("released GPU memory held by dlc stage")
 
 
 def _invoke_dlc(
@@ -317,53 +580,59 @@ def _invoke_dlc(
     Split out so both the bundled-model and user-config code paths can
     call it without duplication.
     """
-    videos = [str(video_path)]
+    try:
+        videos = [str(video_path)]
 
-    # Stage 0.1: detector inference → ..._full.pickle
-    log("analyze_videos: running ResNet detector on every frame")
-    dlc.analyze_videos(
-        str(config_path),
-        videos,
-        videotype="avi",
-        shuffle=shuffle,
-        trainingsetindex=training_set_index,
-        use_shelve=True,
-        auto_track=False,
-        save_as_csv=False,
-    )
-
-    # Stage 0.2: tracklet formation → ..._el.pickle
-    log("convert_detections2tracklets: grouping detections into tracklets")
-    dlc.convert_detections2tracklets(
-        str(config_path),
-        videos,
-        videotype="avi",
-        shuffle=shuffle,
-        trainingsetindex=training_set_index,
-        track_method=track_method,
-    )
-
-    # Stage 0.3: convert the tracklet pickle into the two CSVs the
-    # extract stage reads.
-    log("el_to_csv: converting _el.pickle -> picklesingle.csv + picklemulti.csv")
-    from .el_to_csv import el_pickle_to_csvs
-
-    pickle_matches = sorted(video_path.parent.glob(f"{video_path.stem}DLC*el.pickle"))
-    if not pickle_matches:
-        # Also look in output_dir if it's different.
-        if output_dir is not None:
-            pickle_matches = sorted(Path(output_dir).glob(f"{video_path.stem}DLC*el.pickle"))
-    if not pickle_matches:
-        raise FileNotFoundError(
-            f"convert_detections2tracklets ran but no _el.pickle was "
-            f"written. Looked in {video_path.parent} and "
-            f"{output_dir}. Check the DLC output manually."
+        # Stage 0.1: detector inference → ..._full.pickle
+        log("analyze_videos: running ResNet detector on every frame")
+        dlc.analyze_videos(
+            str(config_path),
+            videos,
+            videotype="avi",
+            shuffle=shuffle,
+            trainingsetindex=training_set_index,
+            use_shelve=True,
+            auto_track=False,
+            save_as_csv=False,
         )
-    single_csv, multi_csv = el_pickle_to_csvs(
-        pickle_matches[0],
-        output_dir=output_dir or video_path.parent,
-    )
-    return {
-        "single_csv": single_csv,
-        "multi_csv": multi_csv,
-    }
+
+        # Stage 0.2: tracklet formation → ..._el.pickle
+        log("convert_detections2tracklets: grouping detections into tracklets")
+        dlc.convert_detections2tracklets(
+            str(config_path),
+            videos,
+            videotype="avi",
+            shuffle=shuffle,
+            trainingsetindex=training_set_index,
+            track_method=track_method,
+        )
+
+        # Stage 0.3: convert the tracklet pickle into the two CSVs the
+        # extract stage reads.
+        log("el_to_csv: converting _el.pickle -> picklesingle.csv + picklemulti.csv")
+        from .el_to_csv import el_pickle_to_csvs
+
+        pickle_matches = sorted(video_path.parent.glob(f"{video_path.stem}DLC*el.pickle"))
+        if not pickle_matches:
+            # Also look in output_dir if it's different.
+            if output_dir is not None:
+                pickle_matches = sorted(Path(output_dir).glob(f"{video_path.stem}DLC*el.pickle"))
+        if not pickle_matches:
+            raise FileNotFoundError(
+                f"convert_detections2tracklets ran but no _el.pickle was "
+                f"written. Looked in {video_path.parent} and "
+                f"{output_dir}. Check the DLC output manually."
+            )
+        single_csv, multi_csv = el_pickle_to_csvs(
+            pickle_matches[0],
+            output_dir=output_dir or video_path.parent,
+        )
+        return {
+            "single_csv": single_csv,
+            "multi_csv": multi_csv,
+        }
+    finally:
+        # Runs whether DLC finished cleanly or raised -- releasing GPU
+        # memory is just as important on the error path, where the
+        # caller may retry or fall through to a later stage.
+        _release_gpu_after_dlc(log)
