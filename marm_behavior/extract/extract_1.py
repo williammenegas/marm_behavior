@@ -207,6 +207,10 @@ def _remove_short_tracklets(head: np.ndarray) -> None:
     Identifies maximal runs of non-NaN samples in ``head[:,0]``, then NaN-outs
     any run shorter than ``TRACKLET_MIN_SIZE`` whose distance to the previous
     OR next run exceeds ``TRACKLET_GAP_LIMIT``.
+
+    MATLAB pre-computes all distances and sizes before the removal loop,
+    so removing tracklet k does not affect the distance check for tracklet
+    k+1.  We replicate that here.
     """
     n = head.shape[0]
     valid = ~np.isnan(head[:, 0])
@@ -225,23 +229,33 @@ def _remove_short_tracklets(head: np.ndarray) -> None:
             ends.append(i)
             in_run = False
 
-    # Match the loop bounds, which skip the first two and last two runs.
+    # Match the MATLAB loop bounds: ``for i = 3:tracksW-2`` where
+    # ``tracksW = num_tracklets + 1``, i.e. 1-indexed tracklets 3 to
+    # num_tracklets-1 = 0-indexed tracklets 2 to num_tracklets-2.
     n_runs = len(starts)
-    if n_runs < 5:
+    if n_runs < 4:
         return
-    for k in range(2, n_runs - 2):
-        size = ends[k] - starts[k]
-        if size >= TRACKLET_MIN_SIZE:
-            continue
-        d_prev = np.hypot(
+
+    # Pre-compute sizes and distances (MATLAB does this in a separate loop
+    # before the removal loop, so NaN-ing out tracklet k doesn't affect
+    # the distance calculation for tracklet k+1).
+    sizes = [ends[k] - starts[k] for k in range(n_runs)]
+    d_prev = [0.0] * n_runs
+    d_next = [0.0] * n_runs
+    for k in range(2, n_runs - 1):
+        d_prev[k] = np.hypot(
             head[starts[k], 0] - head[ends[k - 1], 0],
             head[starts[k], 1] - head[ends[k - 1], 1],
         )
-        d_next = np.hypot(
+        d_next[k] = np.hypot(
             head[ends[k], 0] - head[starts[k + 1], 0],
             head[ends[k], 1] - head[starts[k + 1], 1],
         )
-        if d_prev > TRACKLET_GAP_LIMIT or d_next > TRACKLET_GAP_LIMIT:
+
+    for k in range(2, n_runs - 1):
+        if sizes[k] >= TRACKLET_MIN_SIZE:
+            continue
+        if d_prev[k] > TRACKLET_GAP_LIMIT or d_next[k] > TRACKLET_GAP_LIMIT:
             head[starts[k] : ends[k] + 1, :] = np.nan
 
 

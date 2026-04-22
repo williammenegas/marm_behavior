@@ -216,8 +216,10 @@ def _fill_small_gaps_42(matrix: np.ndarray) -> None:
         )
         for s, e, t, d in zip(starts, ends, times, dists):
             if t < GAP_TIME_LIMIT and d < GAP_DIST_LIMIT:
+                # MATLAB only fills column i (x), not i+1 (y), because
+                # ``temp_fill(start:end)`` uses linear indexing on an
+                # n×2 matrix and only returns column-1 values.
                 matrix[s : e + 1, i] = temp_fill[s : e + 1, 0]
-                matrix[s : e + 1, i + 1] = temp_fill[s : e + 1, 1]
 
 
 # ---------------------------------------------------------------------------
