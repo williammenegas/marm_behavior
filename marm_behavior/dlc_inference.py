@@ -52,6 +52,7 @@ The stage runs three DLC calls in sequence:
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from contextlib import contextmanager
@@ -62,6 +63,57 @@ from typing import Iterator
 DEFAULT_SHUFFLE = 1
 DEFAULT_TRAINING_SET_INDEX = 0
 DEFAULT_TRACK_METHOD = "ellipse"
+
+
+def _materialisation_root() -> Path:
+    """Return the directory under which per-run materialised DLC
+    projects should be created.
+
+    We deliberately avoid ``tempfile.gettempdir()`` (i.e. ``%TEMP%``
+    on Windows, ``/tmp`` on Linux) because Windows cleanup tools
+    (Storage Sense, Disk Cleanup, CCleaner, enterprise endpoint
+    agents, and users running "clear temp files" manually) routinely
+    sweep that directory mid-run. A DLC inference pass on a long
+    video can take hours, during which time the snapshot files under
+    ``train/`` are opened exactly once (at the start, to load weights
+    into TF) and then never touched again — so any cleanup tool that
+    uses access-time heuristics will classify them as stale and
+    delete them while the run is still in flight. The next DLC call
+    in the same run (``convert_detections2tracklets``) then re-does
+    ``os.listdir(modelfolder/train)``, finds nothing matching
+    ``*.index``, and crashes with
+    ``IndexError: index -1 is out of bounds for axis 0 with size 0``.
+
+    Putting the materialisation under the user's local cache instead
+    keeps it out of the default scope of every cleanup tool we know
+    of, at the cost of ~130 MB of disk that's already consumed by
+    the bundled model's own cache anyway (and which the existing
+    ``finally: shutil.rmtree(...)`` on the context manager still
+    reclaims on normal exit).
+
+    Override with ``MARM_BEHAVIOR_DLC_TMPDIR`` if a specific location
+    is needed (e.g. a large scratch volume, or a shared-cluster
+    node-local path).
+    """
+    override = os.environ.get("MARM_BEHAVIOR_DLC_TMPDIR")
+    if override:
+        root = Path(override).expanduser().resolve()
+    else:
+        # Same fallback chain as _data_files._writable_data_root's
+        # user-cache branch, so the DLC materialisation sits next to
+        # the rest of marm_behavior's cache data.
+        root = (
+            Path(
+                os.environ.get(
+                    "XDG_CACHE_HOME",
+                    str(Path.home() / ".cache"),
+                )
+            )
+            / "marm_behavior"
+            / "dlc_runs"
+        )
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _bundled_model_root() -> Path:
@@ -138,9 +190,16 @@ def _rewrite_project_path(yaml_path: Path, new_project_path: Path) -> None:
 def materialised_model(
     source_root: "Path | None" = None,
 ) -> Iterator[Path]:
-    """Context manager: materialise the bundled DLC project into a temp
-    directory with ``project_path`` rewritten, yield the path to the
-    temp ``config.yaml``, and clean up on exit.
+    """Context manager: materialise the bundled DLC project into a
+    per-run directory under the user's local cache with
+    ``project_path`` rewritten, yield the path to the ``config.yaml``,
+    and clean up on exit.
+
+    The materialisation lives under :func:`_materialisation_root`
+    (``~/.cache/marm_behavior/dlc_runs/`` by default), **not**
+    ``%TEMP%``, so mid-run Windows temp cleanup can't delete the
+    snapshot files out from under a long-running DLC pass. See
+    :func:`_materialisation_root` for the full rationale.
 
     Parameters
     ----------
@@ -151,8 +210,9 @@ def materialised_model(
     Yields
     ------
     Path
-        Absolute path to the rewritten ``config.yaml`` in the temp dir,
-        suitable for passing to ``deeplabcut.analyze_videos``.
+        Absolute path to the rewritten ``config.yaml`` in the
+        materialised dir, suitable for passing to
+        ``deeplabcut.analyze_videos``.
     """
     src = source_root or _bundled_model_root()
     if not src.exists():
@@ -160,10 +220,12 @@ def materialised_model(
             f"bundled DLC model tree not found at {src} — is the package "
             f"installed correctly?"
         )
-    # Use a top-level temp dir rather than mkdtemp() + copy, because
+    # Use a top-level per-run dir rather than mkdtemp() + copy, because
     # DLC's analyze_videos creates sibling files inside the model tree
     # (cached h5 detection scores etc.) that need to be writable.
-    tmp = Path(tempfile.mkdtemp(prefix="bfpy_dlc_"))
+    tmp = Path(
+        tempfile.mkdtemp(prefix="bfpy_dlc_", dir=str(_materialisation_root()))
+    )
     try:
         dst = tmp / "project"
         shutil.copytree(src, dst)
