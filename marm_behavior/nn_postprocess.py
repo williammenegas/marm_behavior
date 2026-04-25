@@ -175,8 +175,23 @@ def _bundled_encoder_path() -> Path:
 
 def _load_reference_dir(reference_dir: Path) -> Dict[str, np.ndarray]:
     """Read all five reference CSV files from ``reference_dir`` into
-    a dict keyed by filename. Uses :func:`numpy.genfromtxt` to match
-    the original's loader exactly.
+    a dict keyed by filename.
+
+    For ``out_inner1.csv`` (3.26 GB on the bundled HF reference set)
+    we cap the parse at ``TSNE_FIT_CAP_ROWS``: every downstream use
+    slices the array to those leading rows before doing anything
+    else (see :func:`_fit_tsne`), so loading the rest is wasted CPU
+    + RAM. Capping cuts peak parse memory by ~6× and turns a
+    multi-tens-of-minutes ``np.genfromtxt`` call into a few minutes.
+    Output is bit-identical: ``(raw - mean) / std`` and a leading-row
+    slice commute, so taking the slice at parse time vs. after
+    elementwise normalisation produces the same ``fit_data``.
+
+    Each parsed array is cached on disk as ``<csv>.<suffix>.npy``
+    next to the source CSV. Subsequent loads (other videos in the
+    same batch, repeat runs, batch mode's :func:`prepare_nn_artifacts`)
+    skip the parse entirely and ``np.load`` the binary cache, which
+    is ~1 s for any of these files.
     """
     out: Dict[str, np.ndarray] = {}
     for name in REFERENCE_FILES:
@@ -187,8 +202,55 @@ def _load_reference_dir(reference_dir: Path) -> Dict[str, np.ndarray]:
                 f"All five reference files must be present in "
                 f"reference_dir: {list(REFERENCE_FILES)}"
             )
-        out[name] = np.genfromtxt(str(path), delimiter=",")
+        max_rows = TSNE_FIT_CAP_ROWS if name == "out_inner1.csv" else None
+        out[name] = _load_csv_cached(path, max_rows=max_rows)
     return out
+
+
+def _load_csv_cached(
+    csv_path: Path, *, max_rows: "Optional[int]" = None
+) -> np.ndarray:
+    """Load a numeric CSV with an on-disk ``.npy`` cache.
+
+    Cache key encodes the row cap so a capped load and an uncapped
+    load don't collide. The cache is invalidated whenever the source
+    CSV's mtime is newer than the cache's mtime, so a user replacing
+    a reference file (e.g. retraining the encoder) just gets a
+    re-parse on the next call. Cache writes are best-effort: if the
+    cache directory isn't writable, or a write fails partway, the
+    function still returns the freshly-parsed array and the next
+    call will simply re-parse.
+
+    A failed read (e.g. a corrupt half-written cache from a crashed
+    run) falls through to a fresh parse rather than raising, so a
+    bad cache file is self-healing.
+    """
+    suffix = f".cap{max_rows}.npy" if max_rows is not None else ".npy"
+    cache_path = csv_path.with_name(csv_path.name + suffix)
+    if (
+        cache_path.exists()
+        and cache_path.stat().st_mtime >= csv_path.stat().st_mtime
+    ):
+        try:
+            return np.load(str(cache_path))
+        except Exception:
+            # Corrupt cache (truncated write, format mismatch, etc.):
+            # fall through to a fresh parse, then overwrite below.
+            pass
+    arr = np.genfromtxt(str(csv_path), delimiter=",", max_rows=max_rows)
+    try:
+        # Use an explicit file handle so np.save doesn't append a
+        # second .npy to a path that already has one.
+        with open(cache_path, "wb") as f:
+            np.save(f, arr, allow_pickle=False)
+    except OSError:
+        # Best-effort cache write; bail without leaving a partial file.
+        if cache_path.exists():
+            try:
+                cache_path.unlink()
+            except OSError:
+                pass
+    return arr
 
 
 # ---------------------------------------------------------------------------
