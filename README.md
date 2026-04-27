@@ -1,10 +1,14 @@
 # marm_behavior
 
-A six-stage multi-animal marmoset behavioral analysis pipeline. Takes a
-video of four differently-marked marmosets in a stereo RGB+depth arena,
-runs DeepLabCut pose estimation, extracts per-animal body-part tracks,
-computes per-frame behavioral features, and projects the features into a
-learned behavioral cluster space.
+A six-stage multi-animal marmoset behavioral analysis pipeline. Takes
+overhead stereo video (720p side-by-side, RGB left + depth right, 60 fps)
+of four differently-marked marmosets recorded with a [Stereolabs ZED
+mini](https://www.stereolabs.com/store/products/zed-mini), runs
+DeepLabCut pose estimation, extracts per-animal body-part tracks,
+computes per-frame behavioral features, and projects the features into
+a learned behavioral cluster space. See
+[Input video requirements](#input-video-requirements) for the full
+spec.
 
 Everything is packaged so a single command runs the full pipeline:
 
@@ -98,6 +102,44 @@ python -m marm_behavior --help
 
 Should print the full usage banner with all the per-colour and
 per-stage flags.
+
+## Input video requirements
+
+The pipeline is built around overhead footage from a
+[Stereolabs ZED mini](https://www.stereolabs.com/store/products/zed-mini)
+camera looking straight down at the arena floor. Every input video is a
+**side-by-side stereo composite**: each frame holds two horizontally
+stacked 1280×720 images, so the full frame is 2560×720.
+
+| | Left half | Right half |
+|---|---|---|
+| **Content** | RGB image of the arena (the camera's left eye) | Per-pixel depth map (depth-from-stereo, encoded as an image) |
+| **Resolution** | 1280 × 720 | 1280 × 720 |
+| **Used by** | `dlc`, `extract`, `process`, `labels` stages — DLC runs pose estimation on the RGB half and the body-part coordinates flow through the rest of the pipeline in this image space | `depths` stage — each tracked body-part `(x, y)` from the RGB half is looked up in the matching pixel of the depth half to attach a `z` value |
+
+| Property | Required value |
+|---|---|
+| Camera | Stereolabs ZED mini |
+| Mount | Overhead, looking straight down at the arena floor |
+| Layout | Side-by-side stereo (RGB left, depth right) |
+| Resolution per half | 1280 × 720 (HD720) |
+| Full composite resolution | 2560 × 720 |
+| Frame rate | 60 fps |
+| Container | `.avi` |
+
+These values are not just suggestions — the bundled DLC model was
+trained on this exact geometry, the alpha-shape hull in
+`ground_normalized.npz` was fit to this image space, and the `depths`
+stage hard-codes the assumption that the depth map occupies the right
+half of every frame. Footage at a different resolution, frame rate,
+mounting angle, or stereo layout will run end-to-end without erroring
+but will produce silently wrong tracks and depth lookups. Re-encode
+or re-record before running the pipeline.
+
+The ZED mini's stock recording tools (the ZED SDK's `ZED_Explorer` and
+`ZED_SVO_Export` utilities, or the ZED-OBS plugin) can write the
+side-by-side `.avi` directly. Set the camera to `HD720` mode at 60 fps
+and choose the side-by-side / depth-map export option.
 
 ## The six stages
 
