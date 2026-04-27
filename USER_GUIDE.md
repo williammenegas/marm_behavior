@@ -2,7 +2,8 @@
 
 This guide explains every command-line flag in detail, when to use it,
 and how it interacts with the rest of the pipeline. For an
-installation walkthrough see [README.md](README.md).
+installation walkthrough and the input video spec (overhead Stereolabs
+ZED mini, 720p side-by-side stereo at 60 fps) see [README.md](README.md).
 
 The CLI is invoked as either:
 
