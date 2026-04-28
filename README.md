@@ -253,8 +253,9 @@ mode is opt-in and intended for initial exploration only.
 
 **Buddy chains.** The NN stage pairs each animal's behavioral features
 with one other animal's features before encoding. The default pairings
-are Red↔Yellow, White↔Blue, Blue↔White, and Yellow↔Red (with a
-secondary fallback if the primary's description CSV isn't present).
+are Red↔Yellow, White↔Blue, Blue↔White, and Yellow↔Red, with two
+further fallbacks per animal so any animal can pair with any other if
+the primary's description CSV isn't present.
 Override per-animal with the `--<color>-buddy` flags — each takes one
 or more short color keys (`r`, `w`, `b`, `y`) in preference order:
 

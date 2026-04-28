@@ -121,12 +121,13 @@ REFERENCE_FILES: Tuple[str, ...] = (
 #: first available buddy (by file existence) is used. Matches the
 #: try/except fallbacks in the original ``run_nn_1.py``: Red->Yellow,
 #: White->Blue, Blue->White, Yellow->Red, with the cross-color
-#: fallback being the second entry in each tuple.
+#: fallback being the second entry in each tuple. The third entry is
+#: a final fallback so every animal can pair with any other animal.
 BUDDY_CHAIN: Dict[str, Tuple[str, ...]] = {
-    "r": ("y", "b"),  # Red    -> Yellow / Blue
-    "w": ("b", "r"),  # White  -> Blue   / Red
-    "b": ("w", "r"),  # Blue   -> White  / Red
-    "y": ("r", "b"),  # Yellow -> Red    / Blue
+    "r": ("y", "b", "w"),  # Red    -> Yellow / Blue   / White
+    "w": ("b", "r", "y"),  # White  -> Blue   / Red    / Yellow
+    "b": ("w", "r", "y"),  # Blue   -> White  / Red    / Yellow
+    "y": ("r", "b", "w"),  # Yellow -> Red    / Blue   / White
 }
 
 #: Short color key -> full title-case name used in output filenames.
