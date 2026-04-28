@@ -610,6 +610,78 @@ def _release_gpu_after_dlc(log) -> None:
     log("released GPU memory held by dlc stage")
 
 
+def _pick_dlc_destfolder(
+    video_path: Path,
+    output_dir: "Path | None",
+    log,
+) -> "Path | None":
+    """Return a short local cache directory for DLC's intermediate
+    files when the natural output path would exceed Windows MAX_PATH,
+    or ``None`` to keep the existing behavior of writing next to the
+    video.
+
+    Background: ``deeplabcut.analyze_videos(..., use_shelve=True)``
+    opens a ``<basename>_full.pickle`` shelve database, which on Python
+    is backed by ``dbm.dumb``. ``dbm.dumb._create`` calls
+    ``open(<path>.dat, 'w', encoding='Latin-1')`` directly, and on
+    Windows that ``open`` raises ``FileNotFoundError [Errno 2]`` for
+    paths at or above MAX_PATH (260 chars) unless the user has
+    system-wide long-path support enabled. The video's parent folder
+    plus the long ``<stem>DLC_resnet50_..._full.pickle.dat`` filename
+    routinely crosses that limit when videos live on a UNC network
+    share with a deep folder structure (e.g.
+    ``\\\\server\\group\\subgroup\\... \\stem.avi``), which is the
+    common storage pattern in research labs. We can't fix the path
+    Python's ``open`` accepts, but we can keep the path short by
+    redirecting DLC's scratch files to a local cache directory via the
+    ``destfolder=`` kwarg both DLC entry points support.
+
+    The check is conservative — it only kicks in when the natural path
+    is dangerously long, so users with normal local paths see
+    completely unchanged behavior (DLC outputs land next to the
+    video). On non-Windows platforms this always returns ``None``
+    because POSIX paths have no comparable hard limit at this length.
+    """
+    if os.name != "nt":
+        return None
+
+    natural_dir = output_dir if output_dir is not None else video_path.parent
+    # Worst-case filename DLC writes with this package's bundled
+    # detector: ``<stem>DLC_resnet50_marm_4Sep5shuffle1_15000_full.pickle.dat``
+    # — that's the file that hits ``open()`` first inside dbm.dumb,
+    # and it's the longest filename DLC creates next to the video.
+    # If a user passes their own retrained model via --dlc-config, the
+    # tag in the middle could differ slightly; we pad a few chars to
+    # cover that.
+    longest_basename = (
+        f"{video_path.stem}DLC_resnet50_marm_4Sep5shuffle1_15000_full.pickle.dat"
+    )
+    natural_path_len = len(str(natural_dir / longest_basename))
+
+    # Windows MAX_PATH is 260 chars (including null terminator), so a
+    # path string of 259 chars is the strict boundary. We use a
+    # slightly more conservative threshold because some Windows file
+    # APIs return errors a few characters early and because individual
+    # DLC builds may produce slightly different filenames.
+    if natural_path_len < 250:
+        return None
+
+    # Use a stable per-video subdirectory under the same cache root the
+    # materialised model lives in. Stable (rather than mkdtemp) so a
+    # re-run for the same video reuses the same workdir, mirroring the
+    # default DLC behavior of overwriting outputs in place.
+    workdir = _materialisation_root() / f"dlc_out_{video_path.stem[:48]}"
+    workdir.mkdir(parents=True, exist_ok=True)
+    log(
+        f"DLC scratch path on the video's folder would be ~"
+        f"{natural_path_len} chars, which hits the Windows MAX_PATH "
+        f"limit (260) and breaks dbm.dumb on use_shelve=True. "
+        f"Redirecting DLC intermediate files (and the resulting CSVs) "
+        f"to {workdir}."
+    )
+    return workdir
+
+
 def _invoke_dlc(
     dlc,
     config_path: Path,
@@ -645,6 +717,17 @@ def _invoke_dlc(
     try:
         videos = [str(video_path)]
 
+        # Pick a short local destfolder for DLC if the natural output
+        # path would hit Windows MAX_PATH; otherwise fall through to
+        # DLC's default (writes next to the video). See the docstring
+        # of _pick_dlc_destfolder for the full rationale.
+        dlc_destfolder = _pick_dlc_destfolder(video_path, output_dir, log)
+        destfolder_kwargs = (
+            {"destfolder": str(dlc_destfolder)}
+            if dlc_destfolder is not None
+            else {}
+        )
+
         # Stage 0.1: detector inference → ..._full.pickle
         log("analyze_videos: running ResNet detector on every frame")
         dlc.analyze_videos(
@@ -656,6 +739,7 @@ def _invoke_dlc(
             use_shelve=True,
             auto_track=False,
             save_as_csv=False,
+            **destfolder_kwargs,
         )
 
         # Stage 0.2: tracklet formation → ..._el.pickle
@@ -667,6 +751,7 @@ def _invoke_dlc(
             shuffle=shuffle,
             trainingsetindex=training_set_index,
             track_method=track_method,
+            **destfolder_kwargs,
         )
 
         # Stage 0.3: convert the tracklet pickle into the two CSVs the
@@ -674,20 +759,44 @@ def _invoke_dlc(
         log("el_to_csv: converting _el.pickle -> picklesingle.csv + picklemulti.csv")
         from .el_to_csv import el_pickle_to_csvs
 
-        pickle_matches = sorted(video_path.parent.glob(f"{video_path.stem}DLC*el.pickle"))
-        if not pickle_matches:
-            # Also look in output_dir if it's different.
-            if output_dir is not None:
-                pickle_matches = sorted(Path(output_dir).glob(f"{video_path.stem}DLC*el.pickle"))
+        # Look for the el.pickle in the destfolder first (if we used
+        # one), then fall back to the legacy locations. Each search
+        # dir is included at most once.
+        search_dirs: list[Path] = []
+        if dlc_destfolder is not None:
+            search_dirs.append(dlc_destfolder)
+        if video_path.parent not in search_dirs:
+            search_dirs.append(video_path.parent)
+        if output_dir is not None and Path(output_dir) not in search_dirs:
+            search_dirs.append(Path(output_dir))
+
+        pickle_matches: list[Path] = []
+        for d in search_dirs:
+            pickle_matches = sorted(d.glob(f"{video_path.stem}DLC*el.pickle"))
+            if pickle_matches:
+                break
         if not pickle_matches:
             raise FileNotFoundError(
                 f"convert_detections2tracklets ran but no _el.pickle was "
-                f"written. Looked in {video_path.parent} and "
-                f"{output_dir}. Check the DLC output manually."
+                f"written. Looked in "
+                f"{', '.join(str(d) for d in search_dirs)}. "
+                f"Check the DLC output manually."
             )
+
+        # When we used a destfolder, write the CSVs there too — the
+        # natural CSV filename is a few chars longer than the .pickle.dat
+        # that triggered the rerouting, so the same MAX_PATH issue
+        # would bite el_pickle_to_csvs's open() call. The pipeline
+        # consumes these CSVs by path (returned from this function),
+        # not by glob, so their location is transparent to callers.
+        csv_dir = (
+            dlc_destfolder
+            if dlc_destfolder is not None
+            else (output_dir or video_path.parent)
+        )
         single_csv, multi_csv = el_pickle_to_csvs(
             pickle_matches[0],
-            output_dir=output_dir or video_path.parent,
+            output_dir=csv_dir,
         )
         return {
             "single_csv": single_csv,
