@@ -30,10 +30,10 @@ Both forms accept the same arguments.
 | `--nn-bootstrap` | Generate missing NN references from this video | off |
 | `--force-nn` | Run the NN stage even in one-animal mode | off |
 | `--prefetch-data` | Download bundled HF data files up-front and exit | off |
-| `--red-buddy` | Override the buddy chain for Red in the NN stage | Yellow → Blue |
-| `--white-buddy` | Override the buddy chain for White | Blue → Red |
-| `--blue-buddy` | Override the buddy chain for Blue | White → Red |
-| `--yellow-buddy` | Override the buddy chain for Yellow | Red → Blue |
+| `--red-buddy` | Override the buddy chain for Red in the NN stage | Yellow → Blue → White |
+| `--white-buddy` | Override the buddy chain for White | Blue → Red → Yellow |
+| `--blue-buddy` | Override the buddy chain for Blue | White → Red → Yellow |
+| `--yellow-buddy` | Override the buddy chain for Yellow | Red → Blue → White |
 | `--no-red` | Mark Red as not present in the video | Red present |
 | `--no-white` | Mark White as not present | White present |
 | `--no-blue` | Mark Blue as not present | Blue present |
@@ -461,10 +461,10 @@ first buddy whose description CSV is on disk.
 
 | Self | Default chain |
 |---|---|
-| Red | Yellow → Blue |
-| White | Blue → Red |
-| Blue | White → Red |
-| Yellow | Red → Blue |
+| Red | Yellow → Blue → White |
+| White | Blue → Red → Yellow |
+| Blue | White → Red → Yellow |
+| Yellow | Red → Blue → White |
 
 **Override examples:**
 
