@@ -64,6 +64,10 @@ def run_extract_pipeline(
     c_thresh: float = 0.1,
     target_coverage: float = 1.0,
     focal_animal: "str | None" = None,
+    red_present: bool = True,
+    white_present: bool = True,
+    blue_present: bool = True,
+    yellow_present: bool = True,
 ) -> dict[str, np.ndarray]:
     """Run the full Stage-1 extract pipeline on one video's CSVs.
 
@@ -93,6 +97,13 @@ def run_extract_pipeline(
         across colours, so the proximity-based assignment would
         otherwise scatter the focal animal's tracklets across
         whichever colours got mislabeled.
+    red_present, white_present, blue_present, yellow_present:
+        Per-animal presence flags. Any colour marked not present has its
+        output matrix blanked to all-NaN after assignment (matching the
+        one-animal branch's contract for absent animals). Blanking happens
+        *after* the four-animal assignment chain — that chain uses all four
+        colours' head anchors interdependently, so dropping a colour
+        mid-assignment would corrupt the present animals.
 
     Returns
     -------
@@ -202,6 +213,17 @@ def run_extract_pipeline(
         ground_normalized_path=ground_normalized_path,
         target_coverage=target_coverage,
     )
+
+    # Blank any excluded animals to all-NaN, matching the one-animal
+    # branch's contract for absent animals. Done in place to preserve
+    # each matrix's (n_frames, 42) shape and dtype.
+    present_by_name = {
+        "Red": red_present, "White": white_present,
+        "Blue": blue_present, "Yellow": yellow_present,
+    }
+    for name, present in present_by_name.items():
+        if not present:
+            final[name][:] = np.nan
     return final
 
 
@@ -266,6 +288,10 @@ def run_process_pipeline(
     *,
     ground_normalized_path: "str | Path | None" = None,
     focal_animal: "str | None" = None,
+    red_present: bool = True,
+    white_present: bool = True,
+    blue_present: bool = True,
+    yellow_present: bool = True,
 ) -> Dict[str, np.ndarray]:
     """Run the Stage-2 process pipeline on a tracks dict.
 
@@ -283,6 +309,11 @@ def run_process_pipeline(
         animal gets the full per-frame body-length computation; the
         other three get a constant ``bh = 30``. ``None`` (the default)
         applies the full computation to all four animals.
+    red_present, white_present, blue_present, yellow_present:
+        Per-animal presence flags. Any colour marked not present has its
+        two edge matrices (``F_3*``/``F_4*``) zeroed out, matching the
+        zero-array convention :func:`run_depths_1` already uses for absent
+        animals downstream.
 
     Returns
     -------
@@ -294,7 +325,26 @@ def run_process_pipeline(
     p2 = run_process_2(animals)
     p3 = run_process_3(p2, focal_animal=focal_animal)
     p4 = run_process_4(p2, p3, animals, ground_normalized_path=ground_normalized_path)
-    return p4.as_dict()
+    edges = p4.as_dict()
+
+    # Zero out any excluded animals' edge matrices, matching the
+    # zero-array convention run_depths_1 uses for absent animals. Done in
+    # place to preserve each matrix's (n_frames, 375) shape and dtype.
+    edge_keys = {
+        "white": ("F_3E", "F_4E"),
+        "blue": ("F_3BE", "F_4BE"),
+        "red": ("F_3RE", "F_4RE"),
+        "yellow": ("F_3YE", "F_4YE"),
+    }
+    present = {
+        "white": white_present, "blue": blue_present,
+        "red": red_present, "yellow": yellow_present,
+    }
+    for color, (k3, k4) in edge_keys.items():
+        if not present[color]:
+            edges[k3][:] = 0
+            edges[k4][:] = 0
+    return edges
 
 
 # ---------------------------------------------------------------------------

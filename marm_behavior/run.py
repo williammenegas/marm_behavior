@@ -371,6 +371,10 @@ def run(
             c_thresh=c_thresh,
             target_coverage=target_coverage,
             focal_animal=focal_animal,
+            red_present=red_present,
+            white_present=white_present,
+            blue_present=blue_present,
+            yellow_present=yellow_present,
         )
         save_tracks(str(tracks_path), tracks)
         stages_run.append("extract")
@@ -390,6 +394,10 @@ def run(
             tracks=tracks,
             ground_normalized_path=ground_normalized_path,
             focal_animal=focal_animal,
+            red_present=red_present,
+            white_present=white_present,
+            blue_present=blue_present,
+            yellow_present=yellow_present,
         )
         save_edges(str(edges_path), edges)
         stages_run.append("process")
